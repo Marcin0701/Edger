@@ -2,11 +2,18 @@
 #include <opencv2/highgui/highgui.hpp>
 #include "opencv2/imgproc/imgproc.hpp" 
 
-#include "Window.hpp"
+
+#include <fstream>
 
 
+void ShowWindow(const cv::String& name, const cv::Mat& img)
+{
+	cv::namedWindow(name, cv::WINDOW_AUTOSIZE);
+	cv::imshow(name, img);
+}
 
-cv::Mat MarkEdges(const cv::Mat& src, const cv::Mat& canny, const std::string& winname)
+
+cv::Mat MarkEdges(const cv::Mat& src, const cv::Mat& canny, const cv::String& winname)
 {
 	cv::Mat edges;
 	cv::cvtColor(canny, edges, cv::COLOR_GRAY2BGR);
@@ -35,22 +42,79 @@ cv::Mat MarkEdges(const cv::Mat& src, const cv::Mat& canny, const std::string& w
 		}
 	}
 
-	Window win(winname, ret);
-	win.Show();
+
+	ShowWindow(winname, ret);
 
 	return ret.clone();
 }
 
 
-
-void ProgramProcedure(cv::Mat& image)
+cv::Mat CreateInpaintMask(const cv::Mat& hsv)
 {
-	static unsigned i = 1;
+	cv::Mat mask;
+	mask = cv::Mat::zeros(hsv.size(), hsv.type());
+
+	for (int j = 0; j < hsv.rows; ++j)
+	{
+		for (int i = 0; i < hsv.cols; ++i)
+		{
+			cv::Vec3b rpixel = hsv.at<cv::Vec3b>(cv::Point(i, j));
+
+			unsigned val = static_cast<unsigned>(rpixel[2]);
+
+			if (val > 230)
+			{
+				cv::Vec3b& wpixel = mask.at<cv::Vec3b>(cv::Point(i, j));
+				wpixel[2] = 255;
+			}
+		}
+	}
+
+	std::vector<cv::Mat> maskc;
+	cv::split(mask, maskc);
+	return maskc[2];
+}
+
+
+void ZapisDoPliku(const cv::Mat& image, const cv::String& filename, const cv::String& prefix)
+{
+	cv::String name(prefix);
+	name += filename + ".txt";
+	std::ofstream oFile(name, std::ios::out);
+
+	if (oFile)
+	{
+		oFile << "width " + filename << std::endl;
+		oFile << "[nr] [pixval]" << std::endl;
+
+		std::vector<int> line;
+		line.reserve(image.cols);
+		for (int i = 0; i < image.cols; ++i)
+		{
+			int val = static_cast<int>(image.at<uchar>(cv::Point(i, 100)));
+			line.push_back(val);
+		}
+
+		int i = 1;
+		for (auto& it : line)
+		{
+			oFile << i << " " << it << std::endl;
+			++i;
+		}
+	}
+}
+
+
+
+void ProgramProcedure(cv::Mat& image, const cv::String& name)
+{
+	static unsigned k = 1;
 
 	std::stringstream str;
-	str << i;
+	str << k;
+	cv::String uniq(str.str());
 
-	// BGR -> HSV:
+	// Konwersja do HSV:
 	cv::Mat hsv;
 	cv::cvtColor(image, hsv, cv::COLOR_BGR2HSV);
 
@@ -58,34 +122,146 @@ void ProgramProcedure(cv::Mat& image)
 	std::vector<cv::Mat> hsvc;
 	cv::split(hsv, hsvc);
 
-	// Wyostrzanie:
-	cv::Mat gauss, sharp;
-	cv::GaussianBlur(hsvc[2], gauss, cv::Size(0, 0), 25);
-	cv::addWeighted(hsvc[2], 1.5, gauss, -0.5, 0, sharp);
+	cv::Mat gray;
+	hsvc[2].copyTo(gray);
+
+	ZapisDoPliku(gray, name, "1orig");
+
+	// Usuwanie tekstu:
+	cv::Mat mask = CreateInpaintMask(hsv);
+	cv::inpaint(gray, mask, gray, 2.0, cv::INPAINT_TELEA);
+	mask.release();
 
 	// Wygladzanie:
-	cv::Mat smooth;
-	cv::GaussianBlur(sharp, smooth, cv::Size(3, 3), 75);
+	cv::GaussianBlur(gray, gray, cv::Size(7, 7), 4.5);
 
-	// Operacja otwarcia (erozja -> dylatacja):
-	const cv::Mat elem = cv::getStructuringElement(cv::MORPH_RECT, cv::Size(9, 9), cv::Point(-1, -1));
-	cv::erode(smooth, smooth, elem);
-	cv::dilate(smooth, smooth, elem);
+	// Krawedzie:
 
-	// Powtorne wygladzanie:
-	cv::GaussianBlur(smooth, smooth, cv::Size(3, 3), 75);
+	cv::Mat delt;
+	delt.create(gray.size(), gray.type());
+	const int kernel_left = 3;
+	const int kernel_right = 3;
 
-	// Znajdowanie linii (algorytm Canny'ego):
-	const int threshold = 16;
-	cv::Mat canny;
-	cv::Canny(smooth, canny, 0, threshold);
+	for (int j = 0; j < gray.rows; ++j)
+	{
+		for (int i = 0; i < gray.cols; ++i)
+		{
+			int& r = reinterpret_cast<int&>(delt.at<uchar>(cv::Point(i, j)));
+			int vall, valr;
 
-	// Wyjscie:
-	Window windowc(str.str() + ". Canny", canny);
-	windowc.Show();
-	MarkEdges(image, canny, str.str() + ". Edges");
+			if ((i - kernel_left) < 0)
+				vall = static_cast<int>(gray.at<uchar>(cv::Point(0, j)));
+			else
+				vall = static_cast<int>(gray.at<uchar>(cv::Point(i - kernel_left, j)));
 
-	++i;
+			if ((i + kernel_right) >= gray.cols)
+				valr = static_cast<int>(gray.at<uchar>(cv::Point(gray.cols-1, j)));
+			else
+				valr = static_cast<int>(gray.at<uchar>(cv::Point(i + kernel_right, j)));
+
+			const int delta = abs(valr - vall);
+			r = delta;
+		}
+	}
+
+
+	//ShowWindow(uniq + " Gradient " + name, delt1);
+
+	cv::Mat edges;
+	edges.create(gray.size(), gray.type());
+
+
+	for (int j = 0; j < delt.rows; ++j)
+	{
+		float sum = 0;
+		float avg = 0;
+
+		for (int i = 0; i < delt.cols; ++i)
+		{
+			const float value = static_cast<float>(delt.at<uchar>(cv::Point(i, j)));
+
+			if (value != 0)
+			{
+				avg +=	value;
+				sum += 1;
+			}
+		}
+
+		avg = avg / sum;
+
+		for (int i = 0; i < delt.cols; ++i)
+		{
+			int& r = reinterpret_cast<int&>(edges.at<uchar>(cv::Point(i, j)));
+			const float value = static_cast<float>(delt.at<uchar>(cv::Point(i, j)));
+			if (value > avg)
+				r = 255;
+			else
+				r = 0;
+		}
+	}
+
+
+	cv::Mat dilero;
+	edges.copyTo(dilero);
+
+	cv::dilate(dilero, dilero, cv::Mat());
+	//cv::dilate(dilero, dilero, cv::Mat());
+	cv::erode(dilero, dilero, cv::Mat());
+	//cv::erode(dilero, dilero, cv::Mat());
+
+	//ShowWindow(uniq + " Dilero " + name, dilero);
+	cv::String n(uniq);
+	n += ". " + name;
+	MarkEdges(image, dilero, n);
+
+
+
+	// Krawedzie:
+
+	/*
+	const int M = gray.cols;
+	const int N = gray.rows;
+
+	// Srednia Ai:
+
+	std::vector<float> Ai;
+	Ai.reserve(N);
+
+	for (int i = 0; i < N; ++i)
+	{
+		int aitemp = 0;
+
+		for (int j = 0; j < M; ++j)
+		{
+			aitemp += static_cast<int>(gray.at<uchar>(cv::Point(j, i)));
+		}
+
+		Ai.push_back(static_cast<float>(aitemp /M));
+	}
+
+	// Srednia Aj:
+
+	std::vector<float> Aj;
+	Aj.reserve(M);
+
+	for (int j = 0; j < M; ++j)
+	{
+		int ajtemp = 0;
+
+		for (int i = 0; i < N; ++i)
+		{
+			ajtemp += static_cast<int>(gray.at<uchar>(cv::Point(j, i)));
+		}
+
+		Aj.push_back(static_cast<float>(ajtemp / N));
+	}
+
+	// Wariancja Vn:
+	*/
+
+
+
+	++k;
 }
 
 
@@ -96,24 +272,25 @@ int main(int argc, char* argv[])
 
 #ifdef _DEBUG
 
-	const cv::String files[] = { "M1_1.jpg", "M1_3.jpg", "H6_d3_s2_0st_40um_1.jpg", "M4_14.jpg" };
+	const cv::String files[] = { "M1_1.jpg", "M1_3.jpg", "M4_14.jpg", "M4_24.jpg", "H6_d3_s2_0st_40um_1.jpg" };
+	//const cv::String files[] = { "M1_3.jpg" };
 
 	for (const auto& file : files)
 	{
 		cv::Mat image = cv::imread(file, cv::IMREAD_COLOR);
 
 		if (!image.empty())
-			ProgramProcedure(image);
+			ProgramProcedure(image, file);
 	}
 
 #else
-	
+
 	for (int i = 1; i < argc; ++i)
 	{
 		cv::Mat image = cv::imread(argv[i], cv::IMREAD_COLOR);
 
 		if (!image.empty())
-			ProgramProcedure(image);
+			ProgramProcedure(image, argv[i]);
 	}
 
 #endif
